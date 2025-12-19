@@ -7,7 +7,7 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.0.0/dist/tf.min.js"></script>
     <style>
-     :root {
+         :root {
             --primary: #1e1e2e;
             --secondary: #252537;
             --accent: #6c5ce7;
@@ -418,6 +418,27 @@
         .execute-btn:hover {
             background: #00ccaa;
         }
+        
+        .score-badge {
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        
+        .score-high {
+            background: #50fa7b;
+            color: #000;
+        }
+        
+        .score-medium {
+            background: #f1fa8c;
+            color: #000;
+        }
+        
+        .score-low {
+            background: #ff5555;
+            color: #fff;
+        }
     </style>
 </head>
 <body>
@@ -434,6 +455,7 @@
             <div class="controls">
                 <label>Filter: <input type="text" id="filterInput" placeholder="e.g. BTCUSDT"></label>
                 <button id="autoExecuteBtn">Enable Auto Execute</button>
+                <button id="clearExecutedBtn" style="background-color: #ff5555;">Clear Executed History</button>
             </div>
             <p>Scanning...<span id="loadingSpinner" class="spinner"></span></p>
 
@@ -446,7 +468,7 @@
                         <th data-col="3">Liquidity</th>
                         <th data-col="4">Exec Prices</th>
                         <th data-col="5">AI Score</th>
-                        <th data-col="6">Advice</th>
+                        <th data-col="6">Execution Score</th>
                         <th data-col="7">Action</th>
                     </tr>
                 </thead>
@@ -609,6 +631,17 @@
 
             // Auto execute button
             document.getElementById('autoExecuteBtn').addEventListener('click', toggleAutoExecute);
+            
+            // Clear executed history button
+            document.getElementById('clearExecutedBtn').addEventListener('click', clearExecutedHistory);
+        }
+
+        // Clear executed opportunities history
+        function clearExecutedHistory() {
+            executedOpportunities.clear();
+            localStorage.removeItem('executedOpportunities');
+            localStorage.removeItem('executedOpportunitiesTimes');
+            alert('Executed opportunities history cleared!');
         }
 
         // Toggle auto execution
@@ -629,10 +662,6 @@
             } else {
                 // Stop auto execution loop
                 stopAutoExecution();
-                
-                // Clear executed opportunities when turning off auto execute
-                executedOpportunities.clear();
-                localStorage.removeItem('executedOpportunities');
             }
         }
 
@@ -649,11 +678,12 @@
                 opportunities.forEach(key => executedOpportunities.add(key));
             }
             
-            autoExecutionInterval = setInterval(() => {
+            autoExecutionInterval = setInterval(async () => {
                 if (!autoExecuteEnabled || isExecutingTrade) return;
                 
-                // Find the best valid opportunity that hasn't been executed yet
+                // Find and score all valid opportunities
                 const validOpportunities = Array.from(document.querySelectorAll('#results tr.clickable'));
+                const scoredOpportunities = [];
                 
                 for (const row of validOpportunities) {
                     const pairs = row.cells[0].innerText.split(' → ').map(pair => 
@@ -662,24 +692,202 @@
                     
                     const key = `${pairs[0]}USDT-${pairs[0]}${pairs[1]}-${pairs[1]}USDT`;
                     
-                    // Skip if already executed
-                    if (executedOpportunities.has(key)) continue;
+                    // Skip if already executed recently (within last 5 minutes)
+                    const executedTime = parseInt(localStorage.getItem(`executed_${key}_time`) || 0);
+                    if (executedTime && Date.now() - executedTime < 300000) { // 5 minutes
+                        continue;
+                    }
                     
                     // Get the execute button
                     const executeBtn = row.querySelector('.execute-btn');
                     if (executeBtn) {
-                        // Execute this opportunity
-                        executeBtn.click();
-                        executedOpportunities.add(key);
+                        // Extract the opportunity data
+                        const op = {
+                            usdtPair: executeBtn.dataset.pair1,
+                            secondPair: executeBtn.dataset.pair2,
+                            thirdPair: executeBtn.dataset.pair3
+                        };
+                        
+                        const prices = [
+                            parseFloat(executeBtn.dataset.price1),
+                            parseFloat(executeBtn.dataset.price2),
+                            parseFloat(executeBtn.dataset.price3)
+                        ];
+                        
+                        // Calculate execution score
+                        const score = await calculateExecutionScore(op, prices, row);
+                        
+                        scoredOpportunities.push({
+                            op,
+                            prices,
+                            row,
+                            score,
+                            key
+                        });
+                    }
+                }
+                
+                // Sort by score (highest first) and execute the best opportunity
+                if (scoredOpportunities.length > 0) {
+                    scoredOpportunities.sort((a, b) => b.score - a.score);
+                    const bestOpportunity = scoredOpportunities[0];
+                    
+                    // Only execute if score is above threshold (e.g., 50)
+                    if (bestOpportunity.score > 50) {
+                        // Execute this opportunity with 10 USDT
+                        autoExecuteOpportunity(bestOpportunity.op, bestOpportunity.prices);
+                        
+                        // Mark as executed with timestamp
+                        executedOpportunities.add(bestOpportunity.key);
+                        localStorage.setItem(`executed_${bestOpportunity.key}_time`, Date.now().toString());
                         
                         // Save executed opportunities to localStorage
                         localStorage.setItem('executedOpportunities', JSON.stringify(Array.from(executedOpportunities)));
                         
                         isExecutingTrade = true;
-                        break;
                     }
                 }
             }, 3000); // Check every 3 seconds
+        }
+
+        // Calculate execution score for an opportunity
+        async function calculateExecutionScore(op, prices, row) {
+            let score = 0;
+            
+            // 1. Profit percentage (higher is better)
+            const profitPercent = parseFloat(row.cells[1].innerText);
+            score += profitPercent * 2; // Weight profit highly
+            
+            // 2. Liquidity score (higher liquidity = better execution)
+            const liquidityText = row.cells[3].innerText;
+            const [liq1, liq2, liq3] = liquidityText.split('/').map(parseFloat);
+            const minLiquidity = Math.min(liq1, liq2, liq3);
+            score += minLiquidity * 0.1; // Add liquidity factor
+            
+            // 3. Recent price stability (check if prices are still valid)
+            try {
+                const response = await fetch('/check_price_stability', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        pairs: [op.usdtPair, op.secondPair, op.thirdPair],
+                        prices: prices
+                    })
+                });
+                
+                const stabilityData = await response.json();
+                if (stabilityData.stable) {
+                    score += 20; // Bonus for stable prices
+                }
+            } catch (error) {
+                console.error('Error checking price stability:', error);
+            }
+            
+            // 4. Trading volume (higher volume = better execution)
+            try {
+                const volumeResponse = await fetch('/get_trading_volume', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        pairs: [op.usdtPair, op.secondPair, op.thirdPair]
+                    })
+                });
+                
+                const volumeData = await volumeResponse.json();
+                const minVolume = Math.min(...Object.values(volumeData));
+                score += minVolume * 0.001; // Add volume factor
+            } catch (error) {
+                console.error('Error getting trading volume:', error);
+            }
+            
+            // 5. AI prediction score (if available)
+            const aiScore = parseInt(row.cells[5].innerText) || 0;
+            score += aiScore * 0.5; // Add AI prediction factor
+            
+            // 6. Order book depth (check for sufficient depth)
+            try {
+                const depthResponse = await fetch('/get_orderbook_depth', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        pairs: [op.usdtPair, op.secondPair, op.thirdPair],
+                        limit: 3
+                    })
+                });
+                
+                const depthData = await depthResponse.json();
+                
+                // Check if order books have sufficient depth for 10 USDT trade
+                const sufficientDepth = Object.values(depthData).every((book, idx) => {
+                    const requiredAmount = idx === 2 ? 10 / prices[idx] : 10; // For sell orders, we need asset amount
+                    const available = idx === 2 ? 
+                        parseFloat(book.bids[0][1]) : // For sell orders, use bid quantity
+                        parseFloat(book.asks[0][1]) * parseFloat(book.asks[0][0]); // For buy orders, use ask quantity * price
+                    
+                    return available >= requiredAmount * 1.5; // 50% buffer
+                });
+                
+                if (sufficientDepth) {
+                    score += 15; // Bonus for sufficient depth
+                }
+            } catch (error) {
+                console.error('Error getting order book depth:', error);
+            }
+            
+            return Math.round(score);
+        }
+
+        // Auto-execute an opportunity
+        function autoExecuteOpportunity(op, prices) {
+            // Check if an arbitrage is already running
+            fetch('/arbitrage_status')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.running) {
+                        console.log('Arbitrage is already running. Skipping auto-execute.');
+                        return;
+                    }
+                    
+                    // Auto-execute with 10 USDT
+                    fetch('/execute_arbitrage', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            pairs: [op.usdtPair, op.secondPair, op.thirdPair],
+                            usdt_amount: 10,  // Fixed 10 USDT for auto-execute
+                            price1: prices[0],
+                            price2: prices[1],
+                            price3: prices[2]
+                        })
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.status === 'success') {
+                            console.log('Auto-execute started successfully');
+                            
+                            // Switch to executor tab to show progress
+                            document.querySelector('.tab-btn[data-tab="executor"]').click();
+                            
+                            // Start monitoring status
+                            updateExecutionStatus();
+                        } else {
+                            console.error('Auto-execute failed:', data.message);
+                            isExecutingTrade = false;
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Auto-execute error:', error);
+                        isExecutingTrade = false;
+                    });
+                });
         }
 
         // Stop auto execution loop
@@ -919,14 +1127,31 @@
             let row = document.getElementById(id);
             const det = await validateOpportunityWithDepth(op);
             const aiScore = await predictScore([op.profitPercent, det.usdtLiquidity, det.secondLiquidity, det.thirdLiquidity]);
+            
+            // Calculate execution score
+            const executionScore = await calculateExecutionScore(op, det.desiredPrices, {
+                cells: [
+                    { innerText: '' }, // dummy cell 0
+                    { innerText: op.profitPercent.toFixed(2) }, // cell 1 - profit
+                    { innerText: '' }, // dummy cell 2
+                    { innerText: `${det.usdtLiquidity}/${det.secondLiquidity}/${det.thirdLiquidity}` }, // cell 3 - liquidity
+                    { innerText: '' }, // dummy cell 4
+                    { innerText: aiScore.toString() } // cell 5 - AI score
+                ]
+            });
+            
             const status = det.isValid ? '<span class="badge-high">Valid</span>' : '<span class="badge-low">Mismatch</span>';
             const prices = det.desiredPrices.join(' / ');
-            const advice = det.isValid ? 'Exec at top prices' : '';
             const liq = `${det.usdtLiquidity}/${det.secondLiquidity}/${det.thirdLiquidity}`;
             const linkTemplate = symbol => {
                 const pair = symbol.replace(/USDT$/,'_USDT');
                 return `https://www.binance.com/en/trade/${pair}?type=spot`;
             };
+            
+            // Determine execution score badge class
+            let scoreClass = 'score-low';
+            if (executionScore > 70) scoreClass = 'score-high';
+            else if (executionScore > 40) scoreClass = 'score-medium';
 
             if (!row) {
                 row = document.createElement('tr');
@@ -946,7 +1171,7 @@
                 <td>${liq}</td>
                 <td>${prices}</td>
                 <td>${aiScore}</td>
-                <td>${advice}</td>
+                <td><span class="score-badge ${scoreClass}">${executionScore}</span></td>
                 <td>
                     ${det.isValid ? `<button class="execute-btn" data-pair1="${op.usdtPair}" data-pair2="${op.secondPair}" data-pair3="${op.thirdPair}" data-price1="${det.desiredPrices[0]}" data-price2="${det.desiredPrices[1]}" data-price3="${det.desiredPrices[2]}">Execute</button>` : 'N/A'}
                 </td>
@@ -1341,4 +1566,4 @@
         document.addEventListener('DOMContentLoaded', init);
     </script>
 </body>
-  </html>
+</html>

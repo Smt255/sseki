@@ -538,6 +538,8 @@ def get_orderbook_depth():
     except Exception as e:
         return jsonify({"error": str(e)})
 
+# ... existing code ...
+
 if __name__ == "__main__":
     # Start balance update thread
     balance_thread = threading.Thread(target=balance_update_thread, daemon=True)
@@ -546,4 +548,16 @@ if __name__ == "__main__":
     # Initial balance update
     update_balances()
     
-    app.run(debug=os.environ.get('FLASK_DEBUG', 'False') == 'True', use_reloader=False)
+    # Get Railway port or default to 5000
+    port = int(os.environ.get("PORT", 5000))
+    
+    # Run with debug mode based on environment variable
+    debug_mode = os.environ.get('FLASK_DEBUG', 'False') == 'True'
+    
+    # Run the app
+    app.run(
+        host='0.0.0.0',
+        port=port,
+        debug=debug_mode,
+        use_reloader=False
+    )

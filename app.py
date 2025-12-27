@@ -6,6 +6,7 @@ import threading
 import os
 from pathlib import Path
 from datetime import datetime, timedelta
+import statistics
 
 # Load environment variables from .env file if it exists
 env_path = Path('.') / '.env'
@@ -41,6 +42,15 @@ arbitrage_status = {
 
 # Track recently executed opportunities
 recently_executed = {}
+
+# Performance tracking
+performance_metrics = {
+    "total_trades": 0,
+    "profitable_trades": 0,
+    "total_profit": 0.0,
+    "pair_performance": {},  # pair_key -> {successes, attempts, avg_profit}
+    "trade_history": []      # Last 100 trades
+}
 
 def get_asset_balance(asset):
     """Get available balance for a specific asset"""
@@ -171,15 +181,18 @@ def wait_for_order_completion(symbol, order_id, step_name):
             print(f"Error checking order status: {e}")
             time.sleep(5)
 
-def execute_arbitrage_task(pairs, usdt_amount, price1, price2, price3):
+def execute_arbitrage_task(pairs, usdt_amount, price1, price2, price3, auto_execute=False):
     """Execute triangular arbitrage strategy (to run in thread)"""
-    global arbitrage_status
+    global arbitrage_status, performance_metrics
     
     # Clear previous logs
     arbitrage_status["logs"] = []
     arbitrage_status["running"] = True
     arbitrage_status["paused"] = False
     arbitrage_status["active_orders"] = {}
+    
+    # Store initial USDT balance for performance tracking
+    initial_usdt = get_asset_balance('USDT')
     
     def log_message(message):
         timestamp = time.strftime("%H:%M:%S")
@@ -188,6 +201,8 @@ def execute_arbitrage_task(pairs, usdt_amount, price1, price2, price3):
         print(log_entry)
     
     log_message("Starting arbitrage execution")
+    if auto_execute:
+        log_message(f"Auto-execute mode: {usdt_amount} USDT")
     
     # Get symbol information
     symbols = [get_symbol_info(p) for p in pairs]
@@ -295,8 +310,54 @@ def execute_arbitrage_task(pairs, usdt_amount, price1, price2, price3):
     usdt_received = wait_for_order_completion(pairs[2], order_id3, "Step 3: Sell for USDT")
     log_message(f"Order filled: Received {usdt_received} USDT")
     
+    # Calculate profit
+    profit = usdt_received - usdt_amount
+    profit_percent = (profit / usdt_amount) * 100
+    
     log_message("Arbitrage execution completed!")
+    log_message(f"Profit: {profit:.4f} USDT ({profit_percent:.2f}%)")
     log_message("Updating account balances...")
+    
+    # Update performance metrics
+    final_usdt = get_asset_balance('USDT')
+    actual_profit = final_usdt - initial_usdt
+    
+    # Generate pair key for performance tracking
+    pair_key = f"{pairs[0]}-{pairs[1]}-{pairs[2]}"
+    
+    if actual_profit > 0:
+        # Update pair performance
+        if pair_key not in performance_metrics['pair_performance']:
+            performance_metrics['pair_performance'][pair_key] = {
+                'successes': 0,
+                'attempts': 0,
+                'total_profit': 0
+            }
+        
+        perf = performance_metrics['pair_performance'][pair_key]
+        perf['attempts'] += 1
+        perf['successes'] += 1
+        perf['total_profit'] += actual_profit
+        
+        # Update global metrics
+        performance_metrics['total_trades'] += 1
+        performance_metrics['profitable_trades'] += 1
+        performance_metrics['total_profit'] += actual_profit
+        
+        # Add to trade history
+        trade_record = {
+            'timestamp': datetime.now().isoformat(),
+            'pair_key': pair_key,
+            'profitable': True,
+            'profit': actual_profit,
+            'amount': usdt_amount
+        }
+        performance_metrics['trade_history'].append(trade_record)
+    
+    # Keep only last 100 trades
+    if len(performance_metrics['trade_history']) > 100:
+        performance_metrics['trade_history'] = performance_metrics['trade_history'][-100:]
+    
     update_balances()
     arbitrage_status["running"] = False
     arbitrage_status["current_step"] = "Execution completed"
@@ -330,6 +391,7 @@ def execute_arbitrage():
     price1 = float(data.get('price1', 0))
     price2 = float(data.get('price2', 0))
     price3 = float(data.get('price3', 0))
+    auto_execute = data.get('auto_execute', False)
     
     if len(pairs) != 3:
         return jsonify({"status": "error", "message": "Exactly 3 trading pairs required"})
@@ -384,7 +446,7 @@ def execute_arbitrage():
         return jsonify({"status": "error", "message": f"Minimum notional not met for {pairs[2]}: {min_notional3} (calculated: {notional3:.6f})"})
     
     # All notional checks passed, start arbitrage
-    thread = threading.Thread(target=execute_arbitrage_task, args=(pairs, usdt_amount, price1, price2, price3))
+    thread = threading.Thread(target=execute_arbitrage_task, args=(pairs, usdt_amount, price1, price2, price3, auto_execute))
     thread.daemon = True
     thread.start()
     
@@ -538,7 +600,145 @@ def get_orderbook_depth():
     except Exception as e:
         return jsonify({"error": str(e)})
 
-# ... existing code ...
+@app.route('/get_market_volatility', methods=['GET'])
+def get_market_volatility():
+    """Calculate current market volatility"""
+    try:
+        # Get BTCUSDT price history for last hour
+        klines = client.get_klines(symbol='BTCUSDT', interval=Client.KLINE_INTERVAL_5MINUTE, limit=12)
+        prices = [float(k[4]) for k in klines]  # Closing prices
+        
+        # Calculate volatility (standard deviation of returns)
+        returns = []
+        for i in range(1, len(prices)):
+            ret = (prices[i] - prices[i-1]) / prices[i-1]
+            returns.append(abs(ret))
+        
+        if returns:
+            volatility = statistics.mean(returns)
+        else:
+            volatility = 0.03
+            
+        return jsonify({"volatility": volatility})
+    except Exception as e:
+        print(f"Error calculating volatility: {e}")
+        return jsonify({"volatility": 0.03, "error": str(e)})
+
+@app.route('/get_pair_performance', methods=['POST'])
+def get_pair_performance():
+    """Get historical performance for a specific arbitrage pair"""
+    data = request.get_json()
+    pair_key = data.get('pair_key')
+    
+    if pair_key in performance_metrics['pair_performance']:
+        perf = performance_metrics['pair_performance'][pair_key]
+        if perf['attempts'] > 0:
+            success_rate = perf['successes'] / perf['attempts']
+            avg_profit = perf['total_profit'] / perf['successes'] if perf['successes'] > 0 else 0
+            return jsonify({
+                "successRate": success_rate,
+                "totalTrades": perf['attempts'],
+                "avgProfit": avg_profit
+            })
+    
+    return jsonify({"successRate": 0.5, "totalTrades": 0, "avgProfit": 0})
+
+@app.route('/get_spreads', methods=['POST'])
+def get_spreads():
+    """Get current spreads for pairs"""
+    data = request.get_json()
+    pairs = data.get('pairs', [])
+    
+    spreads = {}
+    try:
+        for pair in pairs:
+            ticker = client.get_orderbook_ticker(symbol=pair)
+            ask = float(ticker['askPrice'])
+            bid = float(ticker['bidPrice'])
+            spread = (ask - bid) / ask  # Relative spread
+            spreads[pair] = spread
+    except Exception as e:
+        print(f"Error getting spreads: {e}")
+        for pair in pairs:
+            spreads[pair] = 0.005  # Default spread
+    
+    return jsonify(spreads)
+
+@app.route('/get_volume_trend', methods=['POST'])
+def get_volume_trend():
+    """Check if volume is trending up or down"""
+    data = request.get_json()
+    pair = data.get('pair')
+    
+    try:
+        # Get volume for last 3 time periods
+        klines = client.get_klines(symbol=pair, interval=Client.KLINE_INTERVAL_5MINUTE, limit=4)
+        volumes = [float(k[5]) for k in klines]
+        
+        if len(volumes) >= 3:
+            # Calculate trend (latest volume vs average of previous 2)
+            recent_avg = (volumes[1] + volumes[2]) / 2
+            trend = (volumes[0] - recent_avg) / recent_avg
+        else:
+            trend = 0
+            
+        return jsonify({"trend": trend})
+    except Exception as e:
+        print(f"Error getting volume trend: {e}")
+        return jsonify({"trend": 0, "error": str(e)})
+
+@app.route('/update_performance', methods=['POST'])
+def update_performance():
+    """Update performance metrics after a trade"""
+    data = request.get_json()
+    pair_key = data.get('pair_key')
+    profitable = data.get('profitable')
+    profit_amount = data.get('profit_amount', 0)
+    
+    # Update global metrics
+    performance_metrics['total_trades'] += 1
+    if profitable:
+        performance_metrics['profitable_trades'] += 1
+        performance_metrics['total_profit'] += profit_amount
+    
+    # Update pair-specific metrics
+    if pair_key not in performance_metrics['pair_performance']:
+        performance_metrics['pair_performance'][pair_key] = {
+            'attempts': 0,
+            'successes': 0,
+            'total_profit': 0
+        }
+    
+    perf = performance_metrics['pair_performance'][pair_key]
+    perf['attempts'] += 1
+    if profitable:
+        perf['successes'] += 1
+        perf['total_profit'] += profit_amount
+    
+    # Add to trade history
+    trade_record = {
+        'timestamp': datetime.now().isoformat(),
+        'pair_key': pair_key,
+        'profitable': profitable,
+        'profit': profit_amount
+    }
+    performance_metrics['trade_history'].append(trade_record)
+    
+    # Keep only last 100 trades
+    if len(performance_metrics['trade_history']) > 100:
+        performance_metrics['trade_history'] = performance_metrics['trade_history'][-100:]
+    
+    return jsonify({"status": "success"})
+
+@app.route('/get_performance_stats', methods=['GET'])
+def get_performance_stats():
+    """Get overall performance statistics"""
+    return jsonify({
+        "total_trades": performance_metrics['total_trades'],
+        "profitable_trades": performance_metrics['profitable_trades'],
+        "total_profit": performance_metrics['total_profit'],
+        "success_rate": performance_metrics['profitable_trades'] / performance_metrics['total_trades'] if performance_metrics['total_trades'] > 0 else 0
+    })
 
 if __name__ == "__main__":
     # Start balance update thread
@@ -548,16 +748,4 @@ if __name__ == "__main__":
     # Initial balance update
     update_balances()
     
-    # Get Railway port or default to 5000
-    port = int(os.environ.get("PORT", 5000))
-    
-    # Run with debug mode based on environment variable
-    debug_mode = os.environ.get('FLASK_DEBUG', 'False') == 'True'
-    
-    # Run the app
-    app.run(
-        host='0.0.0.0',
-        port=port,
-        debug=debug_mode,
-        use_reloader=False
-    )
+    app.run(debug=os.environ.get('FLASK_DEBUG', 'False') == 'True', use_reloader=False)
